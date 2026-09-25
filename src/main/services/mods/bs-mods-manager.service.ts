@@ -10,7 +10,7 @@ import { deleteFile, deleteFolder, pathExist, Progression } from "../../helpers/
 import { lastValueFrom, Observable } from "rxjs";
 import recursiveReadDir from "recursive-readdir";
 import { sToMs } from "../../../shared/helpers/time.helpers";
-import { copyFile, ensureDir, pathExistsSync, readdirSync } from "fs-extra";
+import { copy, copyFile, ensureDir, pathExistsSync, readdirSync } from "fs-extra";
 import { CustomError } from "shared/models/exceptions/custom-error.class";
 import { popElement } from "shared/helpers/array.helpers";
 import { LinuxService } from "../linux.service";
@@ -311,6 +311,15 @@ export class BsModsManagerService {
 
         // Executing IPA.exe when BSIPA is already installed could potentially corrupt the game.
         const shouldRunIPA = isBSIPA && !pathExistsSync(path.join(versionPath, "winhttp.dll"));
+
+        // ARM64 Proton has no loadable .NET runtime for the IPA.exe injector
+        // (x86 .NET app). Emulate its file drop instead: the BSIPA zip ships
+        // winhttp.dll under IPA/ and the injector under IPA/Data/Managed/, which
+        // IPA.exe would lay out into the game folder. See installBSIPAFiles().
+        if (extracted && shouldRunIPA && this.linuxService.isArm64Proton()) {
+            return this.installBSIPAFiles(version);
+        }
+
         const res = shouldRunIPA
             ? extracted &&
               (await this.executeIPA(version, ["-n"]).catch(e => {
@@ -320,6 +329,48 @@ export class BsModsManagerService {
             : extracted;
 
         return res;
+    }
+
+    // File layout IPA.exe performs on first install: BSIPA's bootstrap dll must
+    // sit next to the game exe and the injector must land in Beat Saber_Data/Managed.
+    // Mods are then pulled from the IPA/Pending folders at launch (see importMod).
+    private async installBSIPAFiles(version: BSVersion): Promise<boolean> {
+        log.info("Installing BSIPA files without IPA.exe (ARM64 Proton has no .NET runtime)");
+
+        const versionPath = await this.bsLocalService.getVersionPath(version);
+        const winhttpSource = path.join(versionPath, "IPA", "winhttp.dll");
+        const winhttpDest = path.join(versionPath, "winhttp.dll");
+
+        if (!pathExistsSync(winhttpSource)) {
+            log.error("BSIPA winhttp.dll not found", winhttpSource);
+            return false;
+        }
+
+        try {
+            await copy(winhttpSource, winhttpDest, { overwrite: true });
+
+            const dataSource = path.join(versionPath, "IPA", "Data");
+            if (pathExistsSync(dataSource)) {
+                await copy(dataSource, path.join(versionPath, "Beat Saber_Data"), { recursive: true });
+            }
+
+            // IPA.exe also lays out IPA/Libs to the game-root Libs folder, which
+            // LibLoader.Configure() traverses at injection. Without it the
+            // injector throws ArgumentException("Directory does not exist", root).
+            const libsSource = path.join(versionPath, "IPA", "Libs");
+            if (pathExistsSync(libsSource)) {
+                await copy(libsSource, path.join(versionPath, "Libs"), { recursive: true });
+            }
+
+            for (const folder of ["IPA/Pending/Plugins", "IPA/Pending/Libs"]) {
+                await ensureDir(path.join(versionPath, folder));
+            }
+        } catch (e) {
+            log.error("Error while installing BSIPA files", e);
+            return false;
+        }
+
+        return true;
     }
 
     private async clearIpaFolder(version: BSVersion): Promise<void> {
@@ -365,7 +416,11 @@ export class BsModsManagerService {
             return;
         }
 
-        await this.executeIPA(version, ["--revert", "-n"]);
+        // IPA.exe --revert cannot run on ARM64 Proton (no .NET host), so just
+        // remove the installed files directly instead.
+        if (!this.linuxService.isArm64Proton()) {
+            await this.executeIPA(version, ["--revert", "-n"]);
+        }
 
         const promises = mod.version.contentHashes.map(content => {
             const file = content.path.replaceAll("IPA/", "").replaceAll("Data", "Beat Saber_Data");
